@@ -30,8 +30,8 @@ flags.DEFINE_integer('target_network_update_frequency', 10000, 'Reset the target
 flags.DEFINE_float('learning_rate', 0.0001, 'Initial learning rate.')
 flags.DEFINE_float('gamma', 0.99, 'Reward discount rate.')
 flags.DEFINE_integer('anneal_epsilon_timesteps', 1000000, 'Number of timesteps to anneal epsilon.')
-flags.DEFINE_string('summary_dir', '/tmp/summaries', 'Directory for storing tensorboard summaries')
-flags.DEFINE_string('checkpoint_dir', '/tmp/checkpoints', 'Directory for storing model checkpoints')
+flags.DEFINE_string('summary_dir', './summaries', 'Directory for storing tensorboard summaries')
+flags.DEFINE_string('checkpoint_dir', './checkpoints', 'Directory for storing model checkpoints')
 flags.DEFINE_integer('summary_interval', 5,
                      'Save training summary to file every n seconds (rounded '
                      'up to statistics interval.')
@@ -40,7 +40,7 @@ flags.DEFINE_integer('checkpoint_interval', 600,
                      'seconds (rounded up to statistics interval.')
 flags.DEFINE_boolean('show_training', True, 'If true, have gym render evironments during training')
 flags.DEFINE_boolean('testing', False, 'If true, run gym evaluation')
-flags.DEFINE_string('checkpoint_path', 'path/to/recent.ckpt', 'Path to recent checkpoint to use for evaluation')
+flags.DEFINE_string('checkpoint_path', '', 'Path to recent checkpoint to use for evaluation. Also used to resume training.')
 flags.DEFINE_string('eval_dir', '/tmp/', 'Directory to store gym evaluation')
 flags.DEFINE_integer('num_eval_episodes', 100, 'Number of episodes to run gym evaluation.')
 FLAGS = flags.FLAGS
@@ -104,7 +104,7 @@ def actor_learner_thread(thread_id, env, session, graph_ops, num_actions, summar
         while True:
             # Forward the deep q network, get Q(s,a) values
             readout_t = q_values.eval(session = session, feed_dict = {s : [s_t]})
-            
+
             # Choose next action based on e-greedy policy
             a_t = np.zeros([num_actions])
             action_index = 0
@@ -117,7 +117,7 @@ def actor_learner_thread(thread_id, env, session, graph_ops, num_actions, summar
             # Scale down epsilon
             if epsilon > final_epsilon:
                 epsilon -= (initial_epsilon - final_epsilon) / FLAGS.anneal_epsilon_timesteps
-    
+
             # Gym excecutes action in game environment on behalf of actor-learner
             s_t1, r_t, terminal, info = env.step(action_index)
 
@@ -128,10 +128,10 @@ def actor_learner_thread(thread_id, env, session, graph_ops, num_actions, summar
                 y_batch.append(clipped_r_t)
             else:
                 y_batch.append(clipped_r_t + FLAGS.gamma * np.max(readout_j1))
-    
+
             a_batch.append(a_t)
             s_batch.append(s_t)
-    
+
             # Update the state and counters
             s_t = s_t1
             T += 1
@@ -144,7 +144,7 @@ def actor_learner_thread(thread_id, env, session, graph_ops, num_actions, summar
             # Optionally update target network
             if T % FLAGS.target_network_update_frequency == 0:
                 session.run(reset_target_network_params)
-    
+
             # Optionally update online network
             if t % FLAGS.network_update_frequency == 0 or terminal:
                 if s_batch:
@@ -155,11 +155,12 @@ def actor_learner_thread(thread_id, env, session, graph_ops, num_actions, summar
                 s_batch = []
                 a_batch = []
                 y_batch = []
-    
+
             # Save model progress
             if t % FLAGS.checkpoint_interval == 0:
-                saver.save(session, FLAGS.checkpoint_dir+"/"+FLAGS.experiment+".ckpt", global_step = t)
-    
+                saver.save(session, FLAGS.checkpoint_dir+"/"+FLAGS.experiment+".ckpt", global_step=t)
+                graph_ops["q_network"].save_weights(FLAGS.checkpoint_dir+"/qnet_weights.keras", True)
+
             # Print end of episode stats
             if terminal:
                 stats = [ep_reward, episode_ave_max_q/float(ep_t), epsilon]
@@ -181,23 +182,26 @@ def build_graph(num_actions):
 
     # Op for periodically updating target network with online network weights
     reset_target_network_params = [target_network_params[i].assign(network_params[i]) for i in range(len(target_network_params))]
-    
+
     # Define cost and gradient update op
     a = tf.placeholder("float", [None, num_actions])
     y = tf.placeholder("float", [None])
     action_q_values = tf.reduce_sum(tf.mul(q_values, a), reduction_indices=1)
     cost = tf.reduce_mean(tf.square(y - action_q_values))
-    optimizer = tf.train.AdamOptimizer(FLAGS.learning_rate)
-    grad_update = optimizer.minimize(cost, var_list=network_params)
+    with tf.device("/cpu:0"):
+      optimizer = tf.train.AdamOptimizer(FLAGS.learning_rate)
+      grad_update = optimizer.minimize(cost, var_list=network_params)
 
-    graph_ops = {"s" : s, 
-                 "q_values" : q_values,
-                 "st" : st, 
-                 "target_q_values" : target_q_values,
-                 "reset_target_network_params" : reset_target_network_params,
-                 "a" : a,
-                 "y" : y,
-                 "grad_update" : grad_update}
+    graph_ops = {"s": s,
+                 "q_values": q_values,
+                 "st": st,
+                 "target_q_values": target_q_values,
+                 "reset_target_network_params": reset_target_network_params,
+                 "a": a,
+                 "y": y,
+                 "grad_update": grad_update,
+                 "q_network": q_network,
+                 "target_q_network": q_network}
 
     return graph_ops
 
@@ -236,7 +240,7 @@ def train(session, graph_ops, num_actions, saver):
 
     # Set up game environments (one per thread)
     envs = [gym.make(FLAGS.game) for i in range(FLAGS.num_concurrent)]
-    
+
     summary_ops = setup_summaries()
     summary_op = summary_ops[-1]
 
@@ -246,6 +250,11 @@ def train(session, graph_ops, num_actions, saver):
     writer = tf.train.SummaryWriter(summary_save_path, session.graph)
     if not os.path.exists(FLAGS.checkpoint_dir):
         os.makedirs(FLAGS.checkpoint_dir)
+
+    if FLAGS.checkpoint_path is not "":
+      print("Loading weights from {}".format(FLAGS.load_weights))
+      saver.restore(session, FLAGS.load_weights)
+      graph_ops["target_q_network"].set_weights(graph_ops["q_network"].get_weights())
 
     # Start num_concurrent actor-learner training threads
     actor_learner_threads = [threading.Thread(target=actor_learner_thread, args=(thread_id, envs[thread_id], session, graph_ops, num_actions, summary_ops, saver)) for thread_id in range(FLAGS.num_concurrent)]
